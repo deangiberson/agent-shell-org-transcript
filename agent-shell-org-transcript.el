@@ -40,6 +40,7 @@
 ;;; Code:
 
 (require 'agent-shell)
+(require 'json)
 (require 'map)
 (require 'org-id)
 
@@ -235,34 +236,57 @@ Converts markdown TEXT to org format when writing to a .org file."
 (defun agent-shell--org-transcript-parse-md (content)
   "Parse a markdown transcript CONTENT into metadata and body.
 
-Returns an alist with keys :agent, :date, :working-dir, :body.
+Returns an alist with keys :agent, :date, :working-dir, :session-id, :body.
 
-For example, given CONTENT starting with:
+Only the header block is searched, so text quoted in the body cannot
+leak into the metadata.  Two header styles are recognized:
 
   # Agent Shell Transcript
   **Agent:** Claude Code
   **Started:** 2024-01-15 14:30:00
   **Working Directory:** /home/user/project
+  ---
 
-returns:
+and YAML front matter, optionally preceded by other lines:
+
+  ---
+  agent: \"Claude Code\"
+  started: \"2024-01-15T14:30:00-08:00\"
+  working_directory: \"/home/user/project\"
+  session_id: \"abc\"
+  ---
+
+Both return:
 
   ((:agent . \"Claude Code\") (:date . \"2024-01-15 14:30:00\") ...)"
-  (let ((agent "Unknown Agent")
-        (date "")
-        (working-dir "")
-        (body-start 0))
-    (when (string-match "\\*\\*Agent:\\*\\* \\(.+\\)" content)
-      (setq agent (string-trim (match-string 1 content))))
-    (when (string-match "\\*\\*Started:\\*\\* \\(.+\\)" content)
-      (setq date (string-trim (match-string 1 content))))
-    (when (string-match "\\*\\*Working Directory:\\*\\* \\(.+\\)" content)
-      (setq working-dir (string-trim (match-string 1 content))))
-    (when (string-match "^---\n\n" content)
-      (setq body-start (match-end 0)))
-    (list (cons :agent agent)
+  (let* ((sep (string-match "^---$" content))
+         (yaml (and sep (eq sep (string-match "---\n[A-Za-z_]+: " content sep))))
+         (header-end (cond (yaml (string-match "^---$" content (+ sep 4)))
+                           (t sep)))
+         (header (substring content 0 header-end))
+         (body (if header-end
+                   (replace-regexp-in-string
+                    "\\`---\n+\\(?:# Agent Shell Transcript\n+\\)?" ""
+                    (substring content header-end))
+                 content))
+         (field (lambda (bold key)
+                  (let ((re (cond (yaml (format "^%s: *\\(.+\\)$" key))
+                                  (bold (format "^\\*\\*%s:\\*\\* *\\(.+\\)$" bold)))))
+                    (when (and re (string-match re header))
+                      (let ((v (string-trim (match-string 1 header))))
+                        (if (and yaml (string-prefix-p "\"" v))
+                            (condition-case nil (json-read-from-string v)
+                              (error (string-trim v "\"" "\"")))
+                          v))))))
+         (date (or (funcall field "Started" "started") "")))
+    ;; ISO 8601 → "YYYY-MM-DD HH:MM:SS", matching the live org header.
+    (when (string-match "\\`\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)T\\([0-9:]\\{8\\}\\)" date)
+      (setq date (concat (match-string 1 date) " " (match-string 2 date))))
+    (list (cons :agent (or (funcall field "Agent" "agent") "Unknown Agent"))
           (cons :date date)
-          (cons :working-dir working-dir)
-          (cons :body (substring content body-start)))))
+          (cons :working-dir (or (funcall field "Working Directory" "working_directory") ""))
+          (cons :session-id (funcall field nil "session_id"))
+          (cons :body body))))
 
 (defun agent-shell--org-transcript-migration-path (dest-dir agent date)
   "Return a destination .org path in DEST-DIR derived from AGENT and DATE.
@@ -284,10 +308,11 @@ For example:
      (format "%s-%s-%04x.org" time-str agent-slug (random 65536))
      dest-dir)))
 
-(defun agent-shell--org-transcript-migration-header (agent date working-dir)
+(defun agent-shell--org-transcript-migration-header (agent date working-dir &optional session-id)
   "Generate an org header for a transcript migrated from markdown.
 
-AGENT, DATE, and WORKING-DIR are strings parsed from the original file."
+AGENT, DATE, and WORKING-DIR are strings parsed from the original file.
+SESSION-ID, when non-nil, is recorded as a Session property."
   (let* ((agent-tag (agent-shell--org-transcript-sanitize-tag agent))
          (project-tag (agent-shell--org-transcript-sanitize-tag
                        (file-name-nondirectory (directory-file-name
@@ -302,14 +327,15 @@ AGENT, DATE, and WORKING-DIR are strings parsed from the original file."
 #+FILETAGS: :agent-shell:%s:%s:
 #+PROPERTY: Agent %s
 #+PROPERTY: Working_Directory %s
-
+%s
 "
             (org-id-new)
             agent date
             date
             agent-tag project-tag
             agent
-            working-dir)))
+            working-dir
+            (if session-id (format "#+PROPERTY: Session %s\n" session-id) ""))))
 
 (defun agent-shell--org-transcript-migrate-file (md-file dest-dir)
   "Convert MD-FILE to org and write it into DEST-DIR.
@@ -323,9 +349,10 @@ Returns the destination path on success, nil on failure."
              (date (map-elt meta :date))
              (working-dir (map-elt meta :working-dir))
              (body (map-elt meta :body))
+             (session-id (map-elt meta :session-id))
              (dest (agent-shell--org-transcript-migration-path dest-dir agent date)))
         (write-region
-         (concat (agent-shell--org-transcript-migration-header agent date working-dir)
+         (concat (agent-shell--org-transcript-migration-header agent date working-dir session-id)
                  (agent-shell--org-transcript-convert body))
          nil dest nil 'no-message)
         dest)
